@@ -1,0 +1,259 @@
+name: "Yana Sandbox"
+description: >-
+  Install the yana CLI and run the full Yana sandbox (proxies + agent
+  container) for a bounded, self-restarting window inside a GitHub Actions job.
+author: "JetBrains"
+
+inputs:
+  agent:
+    description: "Agent name to run (selects .yana/<agent>/agent.yaml in the caller repo)."
+    required: true
+  yana-version:
+    description: "yana CLI release tag to install, or 'latest'."
+    required: false
+    default: "latest"
+  working-directory:
+    description: "Directory containing the caller's yana.yaml (and .yana/<agent>/)."
+    required: false
+    default: "."
+  run-duration-seconds:
+    description: "Total time budget for this job; the sandbox is restarted on early exit until it elapses."
+    required: false
+    default: "3600"
+  # --- Configuration environment (written to the generated proxy-facing .env) ---
+  configuration-envs:
+    description: >-
+      Newline-separated KEY=VALUE pairs written to the generated proxy-facing
+      .env (chmod 600). This is the way to pass ALL secrets and configuration
+      env vars to the sandbox: write the canonical env keys the proxies / CLI
+      read, e.g. OPENROUTER_API_KEY=..., OPENAI_API_KEY=..., ANTHROPIC_API_KEY=...,
+      GITHUB_APP_ID=..., GITHUB_APP_INSTALLATION_ID=..., GIT_TOKEN=...,
+      YANA_TOKEN_SECRET=..., YANA_LIVE_BACKEND_TOKEN=..., BOT_USER_ACCESS_TOKEN=...,
+      SLACK_APP_TOKEN=..., WEB_SEARCH_TOKEN=..., GITHUB_MCP_TOKEN=..., plus any
+      arbitrary per-service / MCP / channel value (NOTION_TOKEN=...) or non-secret
+      configuration (YANA_LIVE_OVERRIDE_PROJECT_ID=...). Reference them in
+      yana.yaml / agent.yaml / mcp.json as ${KEY}. Blank lines and #-comments are
+      ignored; each non-empty line must match ^[A-Za-z_][A-Za-z0-9_]*=; empty
+      values are skipped; every value is masked in logs. Raw multi-line PEMs
+      (a KEY=-----BEGIN... line followed by continuation lines up to -----END)
+      are auto-normalized to a single-line base64 value the proxies accept — so
+      GITHUB_APP_PRIVATE_KEY may be pasted verbatim from a repo secret; for
+      stability, prefer pre-encoding it once (base64 -w0 key.pem).
+    required: false
+    default: ""
+  extra-secrets:
+    description: >-
+      DEPRECATED — use configuration-envs. Kept as an alias for one release: when
+      non-empty its lines are merged AFTER the configuration-envs lines and a
+      deprecation warning is emitted (on duplicate keys the .env parser's
+      last-wins applies). Same KEY=VALUE format, validation, and masking.
+    required: false
+    default: ""
+  ghcr-token:
+    description: "Token with read:packages to pull private ghcr.io/jetbrains/yana/* images."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install yana CLI
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        YANA_VERSION: ${{ inputs.yana-version }}
+      run: |
+        set -euo pipefail
+        REPO="JetBrains/junie-live-fake"
+        INSTALL_DIR="$HOME/.yana/bin"
+        if [ "${YANA_VERSION}" = "latest" ] || [ -z "${YANA_VERSION}" ]; then
+          echo "Installing latest yana CLI via install.sh"
+          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://raw.githubusercontent.com/${REPO}/main/install.sh" | bash
+        else
+          echo "Installing pinned yana CLI ${YANA_VERSION}"
+          os="linux"
+          case "$(uname -m)" in
+            x86_64|amd64) arch="amd64" ;;
+            arm64|aarch64) arch="arm64" ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          asset="yana-${os}-${arch}"
+          api="https://api.github.com/repos/${REPO}/releases/tags/${YANA_VERSION}"
+          json=$(curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" "$api")
+          asset_url=$(echo "$json" | grep -B5 "\"name\": \"${asset}\"" | grep '"url"' | tail -1 | sed 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+          [ -n "$asset_url" ] || { echo "Asset ${asset} not found in ${YANA_VERSION}" >&2; exit 1; }
+          mkdir -p "$INSTALL_DIR"
+          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/octet-stream" -o "${INSTALL_DIR}/yana" "$asset_url"
+          chmod +x "${INSTALL_DIR}/yana"
+        fi
+        echo "${INSTALL_DIR}" >> "$GITHUB_PATH"
+
+    - name: Log in to GHCR
+      shell: bash
+      env:
+        GHCR_TOKEN: ${{ inputs.ghcr-token }}
+        GHCR_ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        if [ -z "${GHCR_TOKEN}" ]; then
+          echo "No ghcr-token provided; skipping GHCR login (assuming images are public or cached)."
+          exit 0
+        fi
+        echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_ACTOR}" --password-stdin
+
+    - name: Generate .env
+      id: gen-env
+      shell: bash
+      env:
+        CONFIGURATION_ENVS: ${{ inputs.configuration-envs }}
+        EXTRA_SECRETS_DEPRECATED: ${{ inputs.extra-secrets }}
+      run: |
+        set -euo pipefail
+        env_file="$(mktemp "${RUNNER_TEMP:-/tmp}/yana-env.XXXXXX")"
+        chmod 600 "$env_file"
+        # The repository the sandbox operates on is defined EXCLUSIVELY in the
+        # caller's yana.yaml / .yana/<agent>/agent.yaml (git.repo_url / git.repos).
+        # The action does not inject repo identity, so it cannot override or
+        # second-guess the config (which previously caused duplicate clones when
+        # the GitHub-context URL casing differed from the hand-written one).
+        #
+        # All secrets and configuration env vars reach the proxy-facing .env
+        # through configuration-envs (a single newline-separated KEY=VALUE
+        # source). The deprecated extra-secrets alias is merged AFTER it for one
+        # release; on duplicate keys the .env parser's last-wins applies.
+        if [ -n "${EXTRA_SECRETS_DEPRECATED:-}" ]; then
+          echo "::warning::'extra-secrets' is deprecated; rename it to 'configuration-envs' (same KEY=VALUE format)."
+        fi
+        combined="${CONFIGURATION_ENVS:-}"$'\n'"${EXTRA_SECRETS_DEPRECATED:-}"
+        count=0
+        # Raw-PEM auto-normalization state. The generated file is a line-based
+        # .env (KEY=VALUE per line), so a multi-line PEM cannot be written as
+        # multiple lines — the proxies' parser would read only the first line as
+        # the value and log.Fatalf on the corrupted key. Instead, when a
+        # 'KEY=-----BEGIN...' line is seen we accumulate every subsequent line
+        # verbatim until '-----END...', then base64-encode the whole raw PEM as
+        # a single-line value (git-proxy/mcp-proxy accept both raw PEM and
+        # base64-encoded PEM — see libraries/git-support/config.go). This lets a
+        # caller paste a repo secret containing a raw PEM directly, without a
+        # pre-processing step; a pre-encoded single-line value keeps working
+        # unchanged (no '-----BEGIN' marker => normal KEY=VALUE path).
+        in_pem=0
+        pem_key=""
+        pem_body=""
+        flush_pem() {
+          local encoded
+          # `base64 -w0` is GNU coreutils; fall back to tr -d '\n' for BSD.
+          encoded=$(printf '%s' "$pem_body" | base64 -w0 2>/dev/null) \
+            || encoded=$(printf '%s' "$pem_body" | base64 | tr -d '\n')
+          echo "::add-mask::${encoded}"
+          printf '%s=%s\n' "$pem_key" "$encoded" >> "$env_file"
+          echo "Auto-normalized raw multi-line PEM for '${pem_key}' to single-line base64 in the generated .env (pre-encode with 'base64 -w0 key.pem' for stability)."
+          count=$(( count + 1 ))
+          in_pem=0
+          pem_key=""
+          pem_body=""
+        }
+        while IFS= read -r line || [ -n "$line" ]; do
+          if [ "$in_pem" = "1" ]; then
+            # Accumulate the PEM body verbatim (preserve internal newlines).
+            pem_body="${pem_body}"$'\n'"${line}"
+            case "$line" in *-----END*) flush_pem ;; esac
+            continue
+          fi
+          # Trim leading/trailing whitespace.
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          [ -z "$line" ] && continue
+          case "$line" in \#*) continue ;; esac
+          # Detect the start of a raw multi-line PEM ('KEY=-----BEGIN ...').
+          # Base64-encoded PEM values never contain '-----BEGIN' (base64 has no
+          # hyphens), so this path only ever fires on genuine raw PEM material.
+          case "$line" in
+            *-----BEGIN*)
+              if ! printf '%s' "$line" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=-----BEGIN'; then
+                echo "::error::configuration-envs contains a stray '-----BEGIN' line without a 'KEY=' prefix; the .env generator cannot recover the key name. Ensure the PEM starts with 'KEY=-----BEGIN...' on its first line."
+                exit 1
+              fi
+              pem_key="${line%%=*}"
+              pem_body="${line#*=}"
+              in_pem=1
+              # A single-line PEM ('BEGIN' and 'END' on the same input line) is
+              # legal too; flush it right away.
+              case "$pem_body" in *-----END*) flush_pem ;; esac
+              continue
+              ;;
+          esac
+          if ! printf '%s' "$line" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*='; then
+            echo "Ignoring malformed configuration-envs line (expected KEY=VALUE): ${line%%=*}..." >&2
+            continue
+          fi
+          key="${line%%=*}"
+          val="${line#*=}"
+          [ -z "$val" ] && continue
+          echo "::add-mask::${val}"
+          printf '%s=%s\n' "$key" "$val" >> "$env_file"
+          count=$(( count + 1 ))
+        done <<< "${combined}"
+        if [ "$in_pem" = "1" ]; then
+          echo "::error::configuration-envs opened a PEM block for '${pem_key}' with '-----BEGIN' but no matching '-----END' line was found; the PEM material is incomplete."
+          exit 1
+        fi
+        echo "env-file=${env_file}" >> "$GITHUB_OUTPUT"
+        echo "Wrote ${count} entr(ies) to generated .env from configuration-envs"
+
+    - name: Resolve yana log directory
+      id: logs
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Fixed internal location; the CLI's --log-file is the only configurable
+        # log path. The action just collects the logs here and exposes them to
+        # the user as a downloadable job artifact.
+        dir="${RUNNER_TEMP:-/tmp}/yana-logs"
+        mkdir -p "$dir"
+        echo "dir=${dir}" >> "$GITHUB_OUTPUT"
+        # The CLI's own default log directory (used by releases that predate the
+        # --log-file flag). Resolve it here so the upload step can collect it with
+        # an absolute path (actions/upload-artifact does not expand '~').
+        home_dir="${HOME}/.yana/logs"
+        mkdir -p "$home_dir"
+        echo "home-dir=${home_dir}" >> "$GITHUB_OUTPUT"
+        echo "yana logs will be written to ${dir} (and ${home_dir}); uploaded as the 'yana-logs' job artifact"
+
+    - name: Run supervised sandbox
+      shell: bash
+      env:
+        YANA_AGENT: ${{ inputs.agent }}
+        YANA_ENV_FILE: ${{ steps.gen-env.outputs.env-file }}
+        YANA_RUN_DURATION_SECONDS: ${{ inputs.run-duration-seconds }}
+        YANA_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        YANA_LOG_DIR: ${{ steps.logs.outputs.dir }}
+      run: |
+        set -euo pipefail
+        # `exec` so run-sandbox.sh REPLACES this wrapper shell and becomes the step's
+        # top-level process — the ONLY process GitHub signals on cancel/timeout. Without
+        # exec, GitHub's SIGINT/SIGTERM would land on this wrapper bash (which does not
+        # forward signals to a child it is waiting on), so run-sandbox.sh + yana would be
+        # SIGKILLed with no chance to snapshot agent state. run-sandbox.sh installs a trap
+        # that forwards the signal down to yana for its clean-shutdown snapshot.
+        exec bash "${GITHUB_ACTION_PATH}/run-sandbox.sh"
+
+    # Upload the yana logs as a job artifact so the user can download the full
+    # logs from the run page. `always()` ensures logs are captured even on failure.
+    - name: Upload yana logs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: yana-logs
+        # Collect BOTH the per-run log files (written via the CLI's --log-file,
+        # honored by newer CLI releases) AND the CLI's own default log directory
+        # (~/.yana/logs), which older releases that predate --log-file write to.
+        # Including both guarantees the real docker compose / sandbox error is
+        # captured regardless of the installed CLI version.
+        path: |
+          ${{ steps.logs.outputs.dir }}
+          ${{ steps.logs.outputs.home-dir }}
+        if-no-files-found: warn
+        retention-days: 7
