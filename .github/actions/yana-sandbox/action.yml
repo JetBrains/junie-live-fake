@@ -50,7 +50,7 @@ inputs:
     required: false
     default: ""
   ghcr-token:
-    description: "Token with read:packages to pull private ghcr.io/jetbrains/yana/* images."
+    description: "Token with read:packages to pull private ghcr.io/jetbrains/oleg/* images."
     required: false
     default: ""
 
