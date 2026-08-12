@@ -1,12 +1,22 @@
 import pg from 'pg';
 import { config } from './config.js';
 
+/**
+ * The JIP connection string ends in `?sslmode=require`, and pg now treats that as an
+ * alias for `verify-full`, which overrides any `ssl` option passed here and fails
+ * against the shared Postgres' private CA ("unable to verify the first certificate").
+ * Strip it and state the intent explicitly. This matches attendee's own posture:
+ * dj_database_url with ssl_require, i.e. libpq semantics — encrypt, do not verify.
+ */
+function connectionString(): string {
+  const u = new URL(config.db.url);
+  u.searchParams.delete('sslmode');
+  return u.toString();
+}
+
 const pool = new pg.Pool({
-  connectionString: config.db.url,
+  connectionString: connectionString(),
   max: 4,
-  // The JIP shared Postgres requires TLS but presents a cert this container has no
-  // CA for, which is the same posture attendee itself uses (dj_database_url with
-  // ssl_require and no CA bundle).
   ssl: { rejectUnauthorized: false },
 });
 
