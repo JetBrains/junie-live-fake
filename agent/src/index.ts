@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
+import * as brain from './brain.js';
 import { config } from './config.js';
 import * as db from './db.js';
 import { Conversation } from './pipeline.js';
@@ -17,6 +18,12 @@ function jsonLog(fields: Record<string, unknown>): void {
   console.log(JSON.stringify({ timestamp: new Date().toISOString(), ...fields }));
 }
 
+async function readJson(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return JSON.parse(Buffer.concat(chunks).toString() || '{}');
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200).end('ok');
@@ -29,12 +36,54 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
+  // Make the bot say something without holding a websocket open. Handy from a script:
+  //   curl -X POST https://agent-dev.labs.jb.gg/say -d '{"text":"привет"}'
+  if (req.url === '/say' && req.method === 'POST') {
+    readJson(req).then(
+      (body) => {
+        const { text, bot_id } = (body ?? {}) as { text?: string; bot_id?: string };
+        if (!text) {
+          res.writeHead(400).end('{"error":"text is required"}');
+          return;
+        }
+        const spoken = brain.speakInto(bot_id, text);
+        if (!spoken) {
+          res.writeHead(404).end('{"error":"no such bot is connected"}');
+          return;
+        }
+        res.writeHead(202).end('{"status":"speaking"}');
+      },
+      (err) => res.writeHead(400).end(JSON.stringify({ error: String(err) })),
+    );
+    return;
+  }
   res.writeHead(404).end();
 });
 
-const wss = new WebSocketServer({ server, path: config.wsPath });
+// Two websocket endpoints: attendee's audio stream, and external controllers. `ws`
+// only filters one path per server, so routing happens in the upgrade handler.
+const audioWss = new WebSocketServer({ noServer: true });
+const controlWss = new WebSocketServer({ noServer: true });
 
-wss.on('connection', (socket: WebSocket) => {
+server.on('upgrade', (req, socket, head) => {
+  const path = (req.url ?? '').split('?')[0];
+  if (path === config.wsPath) {
+    audioWss.handleUpgrade(req, socket, head, (ws) => audioWss.emit('connection', ws, req));
+  } else if (path === config.brain.controlPath) {
+    controlWss.handleUpgrade(req, socket, head, (ws) => controlWss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+controlWss.on('connection', (socket: WebSocket) => {
+  const id = ++connectionSeq;
+  brain.addController(socket, (msg, extra) =>
+    jsonLog({ conn: id, message: msg, ...(extra === undefined ? {} : { extra }) }),
+  );
+});
+
+audioWss.on('connection', (socket: WebSocket) => {
   const id = ++connectionSeq;
   const log = (msg: string, extra?: unknown) =>
     jsonLog({ conn: id, message: msg, ...(extra === undefined ? {} : { extra }) });
@@ -78,6 +127,7 @@ wss.on('connection', (socket: WebSocket) => {
     if (msg.bot_id && !sessionOpening) {
       sessionOpening = true;
       botId = msg.bot_id;
+      conversation.attach(botId);
       db.openSession(botId).then(
         (sid) => {
           sessionId = sid;
@@ -107,6 +157,7 @@ wss.on('connection', (socket: WebSocket) => {
 
   socket.on('close', () => {
     log('attendee disconnected', { botId });
+    conversation.detach();
     if (sessionId !== null) void db.closeSession(sessionId, 'attendee disconnected').catch(() => {});
   });
 
@@ -119,8 +170,11 @@ async function main(): Promise<void> {
     jsonLog({
       message: 'voice agent listening',
       port: config.port,
-      wsPath: config.wsPath,
+      audioPath: config.wsPath,
+      controlPath: config.brain.controlPath,
+      brainMode: config.brain.mode,
       sampleRate: config.sampleRate,
+      outputFrameMs: config.outputFrameMs,
       transcribeModel: config.openai.transcribeModel,
       chatModel: config.openai.chatModel,
       ttsLanguage: config.googleTts.languageCode,
@@ -131,7 +185,8 @@ async function main(): Promise<void> {
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     jsonLog({ message: `received ${sig}, shutting down` });
-    wss.clients.forEach((c) => c.close());
+    audioWss.clients.forEach((c) => c.close());
+    controlWss.clients.forEach((c) => c.close());
     server.close(() => void db.shutdown().finally(() => process.exit(0)));
   });
 }

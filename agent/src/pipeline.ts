@@ -1,4 +1,5 @@
 import { bytesToMs, chunk, msToBytes, Vad } from './audio.js';
+import * as brain from './brain.js';
 import { config } from './config.js';
 import { synthesize } from './google-tts.js';
 import { reply, transcribe, type ChatTurn } from './openai.js';
@@ -11,12 +12,13 @@ export interface ConversationHooks {
 }
 
 /**
- * One meeting's conversation: hear -> transcribe -> answer -> speak.
+ * One meeting's conversation: hear -> transcribe -> decide -> speak.
  *
- * This replaces a single OpenAI Realtime session, which would have done endpointing,
- * transcription, reasoning and speech in one socket. That model is not available on
- * this API key, so each step is a separate call and the turn latency is seconds
- * rather than milliseconds.
+ * "Decide" is either an external controller over CONTROL_PATH or OpenAI, per
+ * BRAIN_MODE. This replaces a single OpenAI Realtime session, which would have done
+ * endpointing, transcription, reasoning and speech in one socket; that model is not
+ * available on this API key, so each step is a separate call and turn latency is
+ * seconds rather than milliseconds.
  */
 export class Conversation {
   private readonly vad: Vad;
@@ -24,6 +26,7 @@ export class Conversation {
   /** While the bot is speaking, incoming audio is ignored (see onAudio). */
   private mutedUntil = 0;
   private busy = false;
+  private botId = 'unknown';
 
   constructor(private readonly hooks: ConversationHooks) {
     this.vad = new Vad((ev) => {
@@ -33,6 +36,19 @@ export class Conversation {
       }
       void this.handleUtterance(ev.pcm);
     });
+  }
+
+  /** Called once the bot id is known, so controllers can address this bot. */
+  attach(botId: string): void {
+    this.botId = botId;
+    brain.registerBot(botId, {
+      speak: (text) => this.sayAloud(text, 'agent'),
+      log: this.hooks.log,
+    });
+  }
+
+  detach(): void {
+    if (this.botId !== 'unknown') brain.unregisterBot(this.botId);
   }
 
   onAudio(pcm: Buffer): void {
@@ -64,17 +80,13 @@ export class Conversation {
       this.history.push({ role: 'user', content: heard });
       this.trimHistory();
 
-      const answer = await reply(this.history);
-      if (!answer) {
-        this.hooks.log('model returned an empty answer, staying quiet');
-        return;
-      }
+      const answer = await this.decide(heard);
+      if (!answer) return;
+
       this.hooks.log('answering', answer);
-      this.hooks.onTurn('agent', answer);
       this.history.push({ role: 'assistant', content: answer });
       this.trimHistory();
-
-      await this.speak(answer);
+      await this.sayAloud(answer, 'agent');
       this.hooks.log('turn complete', { ms: Date.now() - started });
     } catch (err) {
       // A failed turn must not kill the connection: the meeting is still going and the
@@ -88,19 +100,37 @@ export class Conversation {
     }
   }
 
-  private async speak(text: string): Promise<void> {
+  private async decide(heard: string): Promise<string | null> {
+    if (brain.shouldUseExternal()) {
+      const answer = await brain.askControllers(this.botId, heard);
+      if (answer) return answer;
+      if (config.brain.mode === 'external') {
+        this.hooks.log('no controller answered and BRAIN_MODE=external, staying quiet');
+        return null;
+      }
+      this.hooks.log('no controller answered, falling back to openai');
+    }
+    const answer = await reply(this.history);
+    if (!answer) {
+      this.hooks.log('model returned an empty answer, staying quiet');
+      return null;
+    }
+    return answer;
+  }
+
+  /** Synthesizes and streams speech into the meeting. */
+  private async sayAloud(text: string, role: 'agent'): Promise<void> {
     const pcm = await synthesize(text);
     const durationMs = bytesToMs(pcm.length);
     // Mute before the first frame goes out, not after the last: attendee starts playing
     // as soon as it receives audio.
     this.mutedUntil = Date.now() + durationMs + config.vad.selfEchoGuardMs;
+    this.hooks.onTurn(role, text);
 
-    // 200ms frames. Attendee buffers on its side, so this is about keeping individual
-    // websocket messages a sane size rather than pacing playback.
-    for (const frame of chunk(pcm, msToBytes(200))) {
+    for (const frame of chunk(pcm, msToBytes(config.outputFrameMs))) {
       this.hooks.sendAudio(frame.toString('base64'));
     }
-    this.hooks.log('spoke', { ms: durationMs });
+    this.hooks.log('spoke', { ms: durationMs, frameMs: config.outputFrameMs });
   }
 
   private trimHistory(): void {

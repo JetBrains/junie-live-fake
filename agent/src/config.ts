@@ -20,6 +20,24 @@ export const config = {
   // for, so 24000 everywhere means no resampling anywhere.
   sampleRate: num('SAMPLE_RATE', 24000),
 
+  // Frame size for audio sent back into the meeting. Attendee buffers on its side, so
+  // this only decides how big each websocket message is.
+  outputFrameMs: num('OUTPUT_FRAME_MS', 20),
+
+  brain: {
+    // Who decides what to say:
+    //   'auto'     - an external controller if one is connected, otherwise OpenAI
+    //   'external' - only an external controller; stay silent when none is connected
+    //   'openai'   - always OpenAI, ignore controllers
+    mode: (process.env.BRAIN_MODE ?? 'auto') as 'auto' | 'external' | 'openai',
+    // Path an external controller connects to. Separate from wsPath, which attendee
+    // uses for audio.
+    controlPath: process.env.CONTROL_PATH ?? '/control',
+    // How long to wait for a controller to answer before giving up on the turn, so a
+    // wedged controller cannot make the bot hang mid-conversation.
+    timeoutMs: num('BRAIN_TIMEOUT_MS', 60000),
+  },
+
   openai: {
     apiKey: required('OPENAI_API_KEY'),
     // gpt-4o-transcribe and whisper-1 are both available; the former is better.
