@@ -1,0 +1,88 @@
+name: Agent Image
+
+# Builds the attendee voice agent in agent/ and publishes it to
+# ghcr.io/jetbrains/junie-live-fake/agent.
+#
+# It lives in this repository because the repository is public, which makes the ghcr
+# package publicly pullable without a pull secret — the GKE nodes in
+# junie-cloud-dev have no ghcr credentials. The deployment manifests for this service
+# live separately, in JetBrains/attendee-deploy under k8s/.
+#
+# Temporary home, same as the attendee image workflow next to it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/agent-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/jetbrains/junie-live-fake/agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tag
+        id: tag
+        run: |
+          SHA="$(git rev-parse --short=7 HEAD)"
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          echo "tag=${SHA}-${TS}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      # Typecheck before building the image: a compile error is much cheaper to see
+      # here than as a CrashLoopBackOff in the cluster.
+      - name: Typecheck
+        working-directory: agent
+        run: |
+          npm ci
+          npx tsc --noEmit
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: agent
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Agent image published"
+            echo
+            echo "Deploy from JetBrains/attendee-deploy:"
+            echo
+            echo '```'
+            echo "./k8s/deploy_agent.sh ${{ steps.tag.outputs.tag }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
