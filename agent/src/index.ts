@@ -2,7 +2,7 @@ import http from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { config } from './config.js';
 import * as db from './db.js';
-import { RealtimeSession } from './openai-realtime.js';
+import { Conversation } from './pipeline.js';
 
 /** What attendee sends us. See docs/realtime_audio.md in the attendee repo. */
 interface AttendeeMessage {
@@ -43,33 +43,22 @@ wss.on('connection', (socket: WebSocket) => {
 
   let sessionId: number | null = null;
   let botId = 'unknown';
-  let closed = false;
   let warnedSampleRate = false;
 
-  const sendToAttendee = (base64Pcm: string) => {
-    if (socket.readyState !== socket.OPEN) return;
-    socket.send(
-      JSON.stringify({
-        trigger: 'realtime_audio.bot_output',
-        data: { chunk: base64Pcm, sample_rate: config.sampleRate },
-      }),
-    );
-  };
-
-  const realtime = new RealtimeSession(log, {
-    onAudio: sendToAttendee,
-    onSpeechStarted: () => realtime.cancelResponse(),
-    onUserTranscript: (text) => {
-      log('user said', text);
-      if (sessionId !== null) void db.recordTurn(sessionId, 'user', text).catch((e) => log('db write failed', String(e)));
+  const conversation = new Conversation({
+    log,
+    sendAudio: (base64Pcm) => {
+      if (socket.readyState !== socket.OPEN) return;
+      socket.send(
+        JSON.stringify({
+          trigger: 'realtime_audio.bot_output',
+          data: { chunk: base64Pcm, sample_rate: config.sampleRate },
+        }),
+      );
     },
-    onAgentTranscript: (text) => {
-      log('agent said', text);
-      if (sessionId !== null) void db.recordTurn(sessionId, 'agent', text).catch((e) => log('db write failed', String(e)));
-    },
-    onClose: (reason) => {
-      log('openai session closed', reason);
-      if (!closed) socket.close();
+    onTurn: (role, text) => {
+      if (sessionId === null) return;
+      void db.recordTurn(sessionId, role, text).catch((e) => log('db write failed', String(e)));
     },
   });
 
@@ -94,11 +83,11 @@ wss.on('connection', (socket: WebSocket) => {
     }
 
     if (msg.trigger !== 'realtime_audio.mixed') return;
-    const chunk = msg.data?.chunk;
-    if (!chunk) return;
+    const b64 = msg.data?.chunk;
+    if (!b64) return;
 
-    // A mismatch here would mean the agent hears (and speaks) at the wrong pitch, so
-    // it is worth one loud complaint rather than silent garbage audio.
+    // A mismatch means both the transcription and the synthesized reply are pitch- and
+    // speed-shifted, which is worth one loud complaint rather than silent nonsense.
     const rate = msg.data?.sample_rate;
     if (rate !== undefined && rate !== config.sampleRate && !warnedSampleRate) {
       warnedSampleRate = true;
@@ -108,13 +97,11 @@ wss.on('connection', (socket: WebSocket) => {
       });
     }
 
-    realtime.appendAudio(chunk);
+    conversation.onAudio(Buffer.from(b64, 'base64'));
   });
 
   socket.on('close', () => {
-    closed = true;
     log('attendee disconnected', { botId });
-    realtime.close();
     if (sessionId !== null) void db.closeSession(sessionId, 'attendee disconnected').catch(() => {});
   });
 
@@ -129,7 +116,9 @@ async function main(): Promise<void> {
       port: config.port,
       wsPath: config.wsPath,
       sampleRate: config.sampleRate,
-      model: config.openai.model,
+      transcribeModel: config.openai.transcribeModel,
+      chatModel: config.openai.chatModel,
+      ttsLanguage: config.googleTts.languageCode,
     });
   });
 }

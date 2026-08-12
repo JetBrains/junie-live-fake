@@ -4,32 +4,67 @@ function required(name: string): string {
   return v;
 }
 
+function num(name: string, fallback: number): number {
+  const v = process.env[name];
+  return v === undefined ? fallback : Number(v);
+}
+
 export const config = {
-  port: Number(process.env.PORT ?? 8080),
+  port: num('PORT', 8080),
   // Attendee validates that the websocket URL starts with wss://, so in the cluster
   // TLS is terminated by the nginx ingress in front of this service and the pod
   // itself speaks plain ws.
   wsPath: process.env.WS_PATH ?? '/attendee',
 
+  // Attendee accepts 8000, 16000 or 24000. Google TTS returns whatever rate we ask
+  // for, so 24000 everywhere means no resampling anywhere.
+  sampleRate: num('SAMPLE_RATE', 24000),
+
   openai: {
     apiKey: required('OPENAI_API_KEY'),
-    // Overridable because Realtime model ids move fast.
-    model: process.env.OPENAI_REALTIME_MODEL ?? 'gpt-realtime-2.1',
-    baseUrl: process.env.OPENAI_REALTIME_URL ?? 'wss://api.openai.com/v1/realtime',
-    voice: process.env.OPENAI_VOICE ?? 'marin',
-    instructions:
+    // gpt-4o-transcribe and whisper-1 are both available; the former is better.
+    transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-transcribe',
+    // Latency matters more than depth for a voice turn, so a small model by default.
+    chatModel: process.env.OPENAI_CHAT_MODEL ?? 'gpt-4.1-mini',
+    baseUrl: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
+    // Language hint for transcription. Empty lets the model auto-detect, which is
+    // slower and occasionally picks the wrong one on short utterances.
+    transcribeLanguage: process.env.OPENAI_TRANSCRIBE_LANGUAGE ?? '',
+    systemPrompt:
       process.env.AGENT_INSTRUCTIONS ??
       [
-        'You are a helpful assistant joining a live meeting by voice.',
+        'You are a helpful assistant taking part in a live meeting by voice.',
+        'Answer in the language you were addressed in.',
         'Keep replies short and conversational — one or two sentences unless asked for detail.',
-        'You are hearing a mixed audio stream of every participant, so more than one person may speak.',
-        'If you are unsure whether you were addressed, stay quiet.',
+        'Your reply is going to be spoken aloud, so do not use markdown, lists or emoji.',
       ].join(' '),
+    maxHistoryTurns: num('MAX_HISTORY_TURNS', 20),
   },
 
-  // Attendee supports 8000, 16000 and 24000. The OpenAI Realtime API speaks PCM16
-  // mono at 24000, so 24000 lets audio pass through untouched in both directions.
-  sampleRate: Number(process.env.SAMPLE_RATE ?? 24000),
+  googleTts: {
+    // Full service account JSON. Cloud Text-to-Speech rejects API keys outright
+    // ("API keys are not supported by this API"), so this has to be a principal.
+    serviceAccountJson: required('GOOGLE_TTS_SERVICE_ACCOUNT_JSON'),
+    languageCode: process.env.TTS_LANGUAGE_CODE ?? 'ru-RU',
+    // Leave empty to let Google pick a voice for the language.
+    voiceName: process.env.TTS_VOICE_NAME ?? '',
+    speakingRate: num('TTS_SPEAKING_RATE', 1.0),
+  },
+
+  vad: {
+    // Mean absolute amplitude (0..32767) above which a frame counts as speech.
+    // Meeting audio has a noise floor, so this is deliberately not near zero.
+    threshold: num('VAD_THRESHOLD', 500),
+    // Silence needed to consider an utterance finished.
+    hangoverMs: num('VAD_HANGOVER_MS', 700),
+    // Utterances shorter than this are treated as noise and dropped.
+    minSpeechMs: num('VAD_MIN_SPEECH_MS', 400),
+    // Hard cap so one long monologue still gets answered.
+    maxUtteranceMs: num('VAD_MAX_UTTERANCE_MS', 20000),
+    // The bot may hear its own voice back in the mixed stream. Input stays gated
+    // while it speaks, plus this tail, so it does not answer itself.
+    selfEchoGuardMs: num('SELF_ECHO_GUARD_MS', 500),
+  },
 
   // Reuses the attendee database: count/postgresqldatabases in jip-quota is 2/2, so
   // there is no slot for a dedicated one. A separate schema keeps these tables away
