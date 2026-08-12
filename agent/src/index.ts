@@ -44,6 +44,10 @@ wss.on('connection', (socket: WebSocket) => {
   let sessionId: number | null = null;
   let botId = 'unknown';
   let warnedSampleRate = false;
+  // Set synchronously before the insert is awaited. Audio frames arrive faster than
+  // the round trip to Postgres, so checking `sessionId === null` alone let several
+  // frames each start their own INSERT and produced duplicate session rows.
+  let sessionOpening = false;
 
   const conversation = new Conversation({
     log,
@@ -71,7 +75,8 @@ wss.on('connection', (socket: WebSocket) => {
       return;
     }
 
-    if (msg.bot_id && sessionId === null) {
+    if (msg.bot_id && !sessionOpening) {
+      sessionOpening = true;
       botId = msg.bot_id;
       db.openSession(botId).then(
         (sid) => {
